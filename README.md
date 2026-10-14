@@ -8,7 +8,6 @@ Spark executor fails at 3am, can an LLM grounded in a team's own runbook triage
 the failure well enough to be worth acting on?
 
 Independent project. Synthetic data, self-authored runbook, no employer data.
-Source repository is private. Available on request.
 
 ---
 
@@ -27,6 +26,12 @@ Eleven failure modes, plus `UNKNOWN`. The label set is closed, and anything the
 model cannot place returns `UNKNOWN` rather than being forced into the nearest
 plausible bucket.
 
+A POST to `/triage` takes a whole failed run — several errors with their timing —
+and returns which one is the root cause, which are consequences of it, and which,
+occasionally, are genuinely unrelated. `/triage/stream` returns the same thing as
+Server-Sent Events, one per reasoning step, so a caller sees the agent form a
+hypothesis and search rather than fifteen seconds of silence.
+
 Deployed on Azure Container Apps. `/health` is liveness; `/ready` reports corpus
 size and the embedding model actually in use.
 
@@ -44,8 +49,12 @@ At request time the service retrieves candidate runbook entries from a Chroma
 vector store, builds a prompt around them, calls Azure OpenAI, and validates the
 response against the permitted label set before returning it.
 
-**Stack:** Python, FastAPI, Chroma, Azure OpenAI, Docker, Terraform,
-Azure Container Apps.
+Single-log classification is deterministic: one retrieval, one call, one label.
+Multi-error runs go through an agent that chooses what to search for, implemented
+as a LangGraph state machine.
+
+**Stack:** Python, FastAPI, LangGraph, LangChain, Chroma, Azure OpenAI, Docker,
+Terraform, Azure Container Apps.
 
 ---
 
@@ -88,6 +97,140 @@ clean set. That gap is the argument for an LLM being in the system at all.
 
 **Retrieval alone cannot abstain.** It forces every out-of-taxonomy record into a
 known class. The LLM path gets all of them right, at confidence below 0.50.
+
+---
+
+## Multi-error runs
+
+A failed run rarely emits one error. It emits an executor dying, then a stage
+aborting, then the job being killed — and only the first of those is a cause. The
+single-log classifier labels each one in isolation, which is the wrong shape for
+the question an on-call engineer is actually asking.
+
+The agentic path takes the whole run. It forms a hypothesis about what failed,
+searches the runbook for that hypothesis in its own words, compares the returned
+symptoms against the run, and searches again if they do not match. It is capped at
+four searches, after which it is forced to commit.
+
+The taxonomy decision that makes this tractable: **consequences get no failure
+mode.** They are attributed to a root cause and given a descriptive event type.
+The eleven modes stay closed over causes. Without that rule, a stage abort has to
+be labelled as something, and the label set fills up with effects.
+
+Evaluated on 47 generated multi-error runs — 39 with a single cause, 8 with two —
+on four separate metrics rather than one blended number: did it find the root
+cause, did it label that cause correctly, did it correctly identify genuinely
+independent failures, and did it attribute the consequences to the right cause.
+
+---
+
+## Porting to LangGraph, and what it bought
+
+The agentic path was first written as a hand-rolled tool-calling loop against the
+Azure OpenAI API: a while loop, a four-iteration cap, and a forced final call with
+tools disabled. It worked. It was then ported to a LangGraph state machine, and
+both implementations were kept so the difference could be measured rather than
+argued about.
+
+### Parity first
+
+A port that changes behaviour is a rewrite. Before anything was added, the two
+implementations were run against the same 47 runs, with the same retriever, the
+same prompt, the same parser and the same scorer, in the same session.
+
+| | hand-rolled loop | LangGraph |
+|---|---|---|
+| Root cause found | 100% | 100% |
+| Root mode correct | 100% | 100% |
+| Independent failures correct | 93.6% | 91.5% |
+| Consequence attribution correct | 93.6% | 91.5% |
+| Mean reasoning length (characters) | 257 | 254 |
+| Tokens per run | 5,120 | 4,863 |
+| Latency per run | 17.0s | 15.6s |
+
+The two disagree on three runs out of 47, **in both directions** — the loop wins
+two, the graph wins one. All three are two-cause independence calls, the metric
+this corpus cannot establish (see limitations). A port defect would produce
+failures in one direction; churn in both is what sampling looks like.
+
+The honest statement is that the LangGraph implementation reproduces the loop's
+behaviour within observed run-to-run variance. Not "identical". The token and
+latency differences are sampling, not an architectural result, and are reported
+here only so nobody has to wonder whether they were hidden.
+
+### What the framework actually provided
+
+Accuracy was not the point, and a framework swap could not have changed it —
+retrieval, prompt, taxonomy and model are what decide accuracy, and none of them
+moved. What the framework provided is behaviour the loop did not have:
+
+**Control flow as data.** The graph is declared as nodes and edges, so it can draw
+itself. The architecture diagram cannot drift from the implementation because it
+is generated from it.
+
+**Durable execution.** A run that dies partway through resumes from its last
+completed step rather than restarting. Demonstrated by terminating the process
+outright — no exception, no cleanup, no flushed buffers — then resuming in a new
+process and confirming the recovered tokens and messages.
+
+**A human approval gate.** The run stops before its remediation is released, with
+its state persisted and nothing held in memory. A reviewer approves, edits or
+rejects it later, from a different process. A rejection preserves what the model
+proposed, because an audit wants to see what was suggested, not only what was
+allowed.
+
+**Parallel fan-out.** One branch per incident, concurrent, then a join that makes
+every causal call. Branch isolation is enforced by the input schema rather than by
+convention: a branch physically cannot see the other incidents.
+
+**Streaming.** One event per completed reasoning step, so a caller can show the
+agent searching rather than waiting.
+
+### Fan-out, measured
+
+| | single conversation | fan-out |
+|---|---|---|
+| Root cause / mode | 100% / 100% | 100% / 100% |
+| Independent failures correct | 91.5% | 97.9% |
+| Two-cause subset | 50.0% (4/8) | 87.5% (7/8) |
+| Model calls per run | ~2 | incidents + 1 |
+| Tokens per run | 4,863 | 11,988 |
+| Latency per run | 15.6s | 20.7s |
+
+Fan-out cost 2.34× the tokens and was **slower**, not faster. Branches run
+concurrently, but the join waits for the slowest and there is simply more work.
+The prediction that parallelism would pay for the extra calls was wrong.
+
+It scored highest on the metric both other implementations struggled with, and
+there is a plausible mechanism — the join receives explicit per-incident
+assessments rather than holding everything in one conversation. But the gap is two
+runs on a subset of eight, and this same corpus moved by three runs between two
+measurements of the *unchanged* implementation. **Suggestive, not established.**
+Establishing it would need repeated runs, and is not claimed here.
+
+### What splitting the work nearly broke
+
+The single-conversation agent grounds its remediation because the retrieved
+runbook text sits in its conversation history. Fan-out discards that: a branch
+reads the runbook, writes an assessment, and the runbook text dies with the
+branch.
+
+The first version therefore had a join step with no runbook at all, writing
+remediation from the model's own knowledge. It suggested a configuration flag that
+suppresses an error, where the runbook deliberately recommends fixing the query
+semantics instead. **It scored 100% on all four metrics**, because none of them
+look at the remediation field.
+
+The fix was to carry the runbook text forward explicitly, and to record the
+remediation so grounding could be measured rather than spot-checked. Across 47
+fan-out runs, n-gram overlap against the runbook averages 0.87, and every
+low-scoring case traces back to a real runbook section as paraphrase rather than
+invention.
+
+The general lesson, which is the reason this is written up at all: when a pipeline
+is split into parallel parts, anything previously shared implicitly through
+conversation history has to become explicit data. That, rather than the token
+count, is the real cost of fan-out.
 
 ---
 
@@ -139,6 +282,42 @@ Every LLM call has three failure modes: the API errors, the response is not vali
 JSON, or the JSON is valid but the label is out of set. All three return a result
 carrying the error rather than raising. A classifier that throws cannot be run
 over a batch.
+
+### One source of truth across implementations
+
+The iteration cap, the tool description the model reads, the output contract, and
+the function that renders a run into a prompt are each defined once and imported
+by every implementation that needs them.
+
+This is not tidiness. Two hand-maintained copies of a constant that is meant to be
+identical will eventually stop being identical, and at that point a measured
+difference between two implementations is no longer measuring what it claims to.
+The prompt-rendering function in particular had to move out of the evaluation
+scripts, because the container image excludes them — had the service rendered runs
+its own way, every measured number would have described an input production never
+sends.
+
+### Framework defaults turned off deliberately
+
+The LangGraph implementation disables the client library's automatic retries. The
+hand-rolled loop retries once, and only for one specific parameter rejection.
+Leaving the framework's retries on would mean a throttled call silently retried
+underneath the graph, and the token and latency figures the two implementations
+are compared on would include work that was never observed.
+
+When porting for a measured comparison, the framework's helpful behaviours that
+the original did not have are a source of difference, not a free improvement.
+
+### Durability is opt-in, and the default is not durable
+
+Attaching a checkpointer does not by itself give durable execution. The default
+persistence is asynchronous, so a hard crash loses the step in flight — and the
+resume then silently re-runs that work and reports success. The first version of
+the crash-recovery demonstration passed for exactly that reason, and the re-run
+was only visible by inspecting how many tokens and messages actually survived.
+
+Synchronous persistence costs a write per step. That is what durability costs, and
+the default trades it away for speed.
 
 ### A bug the ablation found
 
@@ -197,9 +376,19 @@ a VNet, with the registry and Azure OpenAI reached over private endpoints.
 Production uses a remote backend with locking, and gates apply on a reviewed plan
 in CI authenticating via federated credentials rather than a stored secret.
 
-**Cost.** Roughly 1,570 prompt tokens per incident. At enterprise failure volume
-you would cache repeated signatures and route obvious cases through the cheap
-deterministic path first.
+**A shared checkpoint store.** Durable execution and the approval gate are
+demonstrated against SQLite, which is correct for a demonstration and wrong for
+this deployment: the app scales to zero on an ephemeral filesystem, so the file
+would vanish with the container. Serving them would mean a managed Postgres —
+a one-line change in the application, and a standing cost this project has
+deliberately avoided. They are therefore demonstrable locally and not exposed by
+the deployed service, rather than exposed in a form that silently loses paused
+reviews.
+
+**Cost.** Roughly 1,570 prompt tokens per single incident, and around 5,000 per
+multi-error run through the agentic path. At enterprise failure volume you would
+cache repeated signatures and route obvious cases through the cheap deterministic
+path first.
 
 ---
 
@@ -217,3 +406,28 @@ why retrieval contributes so little here.
 n=48 on the ablation. The gap between the full system and the no-retrieval
 condition is one record. No strong claim should be read into it in either
 direction.
+
+**Independent-failure detection is not measurable with this corpus.** The
+two-cause generator pairs incidents whose failure modes differ, and the ground
+truth then calls them independent. But two modes being different is not the same
+as two failures being causally unrelated, and the model frequently makes a
+defensible argument that the second is downstream — an argument the label does not
+permit. A corpus that could measure this would need hand-curated pairs that are
+genuinely causally independent. Every number reported on that metric should be
+read with this in mind.
+
+**Results are not stable across sessions.** The unchanged hand-rolled
+implementation scored 100% on all four metrics in one session and 93.6% on two of
+them weeks later, on the same corpus. Any single run reported as a fact is
+overstating. The comparisons here were all measured within one session for that
+reason, and differences of two or three runs out of 47 are not treated as results.
+
+**Grounding is measured for one implementation only.** The remediation field was
+not recorded until the fan-out work, so the 0.87 figure covers that path and not
+the others. Comparing grounding across implementations would need the earlier runs
+repeated.
+
+**The grounding check measures quotation, not grounding.** N-gram overlap scores a
+faithful paraphrase of the correct source the same as an invention. It is useful
+for finding cases worth reading by hand, and it does not decide them. The 0.5
+threshold it reports against is a presentation choice, not a pass mark.
