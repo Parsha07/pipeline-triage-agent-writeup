@@ -261,6 +261,71 @@ count, is the real cost of fan-out.
 
 ---
 
+## Observability
+
+The evaluation harness answers "was it right". The structured per-request log
+answers "what happened in this request". Neither answers "where did the 15
+seconds go", which is the question asked when something is slow at 3am.
+
+Spans are emitted for the run, each graph node, each model call and each
+retrieval, using OpenTelemetry. The instrumentation says nothing about where
+traces end up: `TRACING_EXPORTER` selects one JSON line per span through the
+standard logger (the default), Application Insights, or nothing at all.
+
+The default matters. Container Apps already ships stdout to the Log Analytics
+workspace the deployment pays for, so spans become queryable with KQL with no
+new resource, no new credential, and nothing leaving the Azure boundary.
+Application Insights is opt-in and its exporter is deliberately not a
+dependency, because it bills on ingestion and installing it should be a
+decision rather than a side effect of a deploy.
+
+### Why not LangSmith
+
+It is already installed. `langsmith` arrives as a hard dependency of
+`langchain-core`, and it is disabled.
+
+It is a good product. It is also a hosted service outside the Azure boundary
+that requires an API key, and this system was built specifically to have no
+API keys. Pipeline error text in a real deployment carries table names, file
+paths and occasionally credentials inside stack traces. Sending that to a
+third party is a data-residency decision rather than a tooling preference,
+and nothing here needs it.
+
+### What one trace showed
+
+A single two-iteration run, broken down:
+
+| | ms | share |
+|---|---|---|
+| Model calls (2) | 14,288 | 96.1% |
+| Retrieval, including query embedding | 569 | 3.8% |
+| Everything else — graph, nodes, parsing | 8.5 | 0.06% |
+
+Two things fell out of that immediately.
+
+**Retrieval is not cheap, and not for the reason expected.** 569ms is almost
+entirely the query embedding, which is its own API round trip. The Chroma
+lookup itself is negligible. Any latency work on retrieval would need to
+target the embedding call, not the vector search.
+
+**The framework costs 8.5ms.** "Does LangGraph add overhead" now has a measured
+answer rather than an assurance.
+
+**And the instrumentation found a defect in its first run.** The model
+deployment rejects the `temperature` parameter, so every process was sending
+it once, having it refused, and retrying without it — a wasted request on
+every cold start and every evaluation worker. `AZURE_OPENAI_SEND_TEMPERATURE`
+now lets a deployment skip that discovery, and both engines read it so they
+stay comparable.
+
+That fix removes one API request per process. It is **not** a latency
+improvement: across three runs of the same input, total time varied by 1.7
+seconds in both directions, dominated by how many completion tokens the model
+happened to generate. The measurements do not support a performance claim and
+none is made.
+
+---
+
 ## Design decisions
 
 ### No API keys anywhere
@@ -448,6 +513,12 @@ implementation scored 100% on all four metrics in one session and 93.6% on two o
 them weeks later, on the same corpus. Any single run reported as a fact is
 overstating. The comparisons here were all measured within one session for that
 reason, and differences of two or three runs out of 47 are not treated as results.
+
+Part of that instability is not fixable here. The model deployment rejects the
+`temperature` parameter, so decoding cannot be pinned to greedy. The same
+prompt produced 112 completion tokens on one call and 303 on another during a
+single evening. Tighter measurement would need a deployment that accepts
+temperature, or many more repeats per condition.
 
 **Grounding is measured for one implementation only.** The remediation field was
 not recorded until the fan-out work, so the 0.87 figure covers that path and not
