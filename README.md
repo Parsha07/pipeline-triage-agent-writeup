@@ -122,6 +122,33 @@ on four separate metrics rather than one blended number: did it find the root
 cause, did it label that cause correctly, did it correctly identify genuinely
 independent failures, and did it attribute the consequences to the right cause.
 
+### Is the agent worth it?
+
+The same 47 runs through the deterministic single-log classifier, one call per
+run, measured in the same session:
+
+| | deterministic | agentic |
+|---|---|---|
+| Failure mode correct | 95.7% | 100% |
+| — single-cause runs | 100% | 100% |
+| — two-cause runs | 75.0% | 100% |
+| Tokens per run | 2,229 | 5,120 |
+| Latency per run | 6.8s | 17.0s |
+
+The accuracy difference is two runs out of the eight two-cause cases, which is
+not a margin this corpus can distinguish from variance.
+
+The difference that does justify the cost is structural. The deterministic
+classifier returns a label. It cannot identify which error is the root cause,
+cannot attribute consequences to it, and cannot flag an independent second
+failure — those outputs do not exist in its response shape at any price.
+
+So the boundary is not about accuracy. Use the deterministic path when the
+question is "what kind of failure is this": it is 2.3x cheaper and 2.5x faster
+and right about the mode almost always. Use the agent when the question is
+"which of these errors actually caused the others", because the cheap path
+cannot answer it.
+
 ---
 
 ## Porting to LangGraph, and what it bought
